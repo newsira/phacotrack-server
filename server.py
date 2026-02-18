@@ -6,7 +6,9 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 
 from azure.core.credentials import AzureKeyCredential
-from azure.ai.documentintelligence import DocumentIntelligenceClient
+
+# ✅ Use the stable OCR SDK (works reliably with "prebuilt-read")
+from azure.ai.formrecognizer import DocumentAnalysisClient
 
 # OpenAI (optional – only used if OPENAI_API_KEY is set)
 try:
@@ -30,50 +32,40 @@ def root():
     return {"status": "server running"}
 
 
-def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
-    endpoint = env("AZURE_DI_ENDPOINT")
-    key = env("AZURE_DI_KEY")
+def normalize_endpoint(raw: str) -> str:
+    # Remove hidden spaces/newlines + ensure https + no double slashes
+    v = (raw or "").strip()
+    if v.endswith("/"):
+        v = v[:-1]
+    return v
 
-    client = DocumentIntelligenceClient(
+
+def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
+    endpoint = normalize_endpoint(env("AZURE_DI_ENDPOINT"))
+    key = env("AZURE_DI_KEY").strip()
+
+    client = DocumentAnalysisClient(
         endpoint=endpoint,
         credential=AzureKeyCredential(key),
     )
 
-    # FIX: older SDK expects analyze_request=... (not body=...)
+    # Stable call: "prebuilt-read" OCR
     poller = client.begin_analyze_document(
-        "prebuilt-read",
-        analyze_request=file_bytes,
+        model_id="prebuilt-read",
+        document=file_bytes,
         content_type=content_type or "application/octet-stream",
     )
     result = poller.result()
 
-    lines = []
-    if result.pages:
+    lines: list[str] = []
+    if getattr(result, "pages", None):
         for page in result.pages:
-            if page.lines:
+            if getattr(page, "lines", None):
                 for line in page.lines:
-                    if line.content:
+                    if getattr(line, "content", None):
                         lines.append(line.content)
 
     return "\n".join(lines).strip()
-
-
-def _extract_json_object(text: str) -> Dict[str, Any]:
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("Empty OpenAI response")
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("OpenAI did not return JSON")
-
-    return json.loads(text[start : end + 1])
 
 
 def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
@@ -82,7 +74,7 @@ def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
         return {
             "success": True,
             "documentType": "unknown",
-            "fields": {"global": {}, "OD": {}, "OS": {}},
+            "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None},
             "warnings": ["OPENAI_API_KEY not set (returning OCR only)"],
             "rawText": ocr_text,
         }
@@ -127,14 +119,12 @@ Your job:
       "sd": null|number, "numCells": null|number, "pachy": null|number,
       "blocks": []
     }},
-    "OS": {{
-      "AL": null|number, "K1": null|number, "K2": null|number, "ACD": null|number,
-      "LT": null|number, "WTW": null|number, "CCT": null|number,
-      "ecc": null|number, "cv": null|number, "hex": null|number,
-      "avgCellSize": null|number, "maxCellSize": null|number, "minCellSize": null|number,
-      "sd": null|number, "numCells": null|number, "pachy": null|number,
-      "blocks": []
-    }},
+    "OS": {{ "AL": null|number, "K1": null|number, "K2": null|number, "ACD": null|number,
+             "LT": null|number, "WTW": null|number, "CCT": null|number,
+             "ecc": null|number, "cv": null|number, "hex": null|number,
+             "avgCellSize": null|number, "maxCellSize": null|number, "minCellSize": null|number,
+             "sd": null|number, "numCells": null|number, "pachy": null|number,
+             "blocks": [] }},
     "efx": null|string,
     "ust": null|string,
     "avg": null|string
@@ -145,10 +135,9 @@ Your job:
 Rules:
 - Use null when unknown.
 - Numbers must be real numbers (no commas).
-- If phacoSummary, fill efx/ust/avg in fields (global/OD/OS can stay mostly null).
+- If phacoSummary, fill efx/ust/avg in fields.
 - If biometry, blocks can be included if you see IOL tables. Otherwise empty array.
 - Be conservative: don't guess.
-- Output JSON only.
 
 OCR TEXT:
 \"\"\"
@@ -156,16 +145,24 @@ OCR TEXT:
 \"\"\"
 """.strip()
 
-    resp = client.responses.create(
-        model=model,
-        input=prompt,
-    )
-
-    out_text = getattr(resp, "output_text", None)
-    if not out_text:
-        out_text = str(resp)
-
-    return _extract_json_object(out_text)
+    # Try Responses API first (new OpenAI SDK)
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=prompt,
+            response_format={"type": "json_object"},
+        )
+        out_text = resp.output_text
+        return json.loads(out_text)
+    except Exception:
+        # Fallback: Chat Completions API (older compatibility)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        out_text = resp.choices[0].message.content
+        return json.loads(out_text)
 
 
 @app.post("/extract")
@@ -181,7 +178,7 @@ async def extract(file: UploadFile = File(...)):
             return {
                 "success": True,
                 "documentType": "unknown",
-                "fields": {"global": {}, "OD": {}, "OS": {}},
+                "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None},
                 "warnings": ["No OCR text found"],
             }
 

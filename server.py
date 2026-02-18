@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Dict, Any
 
 from fastapi import FastAPI, UploadFile, File
@@ -38,29 +39,48 @@ def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
         credential=AzureKeyCredential(key),
     )
 
-    # Use positional body argument to avoid SDK keyword mismatch issues.
     poller = client.begin_analyze_document(
         "prebuilt-read",
-        file_bytes,
+        body=file_bytes,
         content_type=content_type or "application/octet-stream",
     )
     result = poller.result()
 
     lines = []
-    # Extract all text lines in reading order
-    if getattr(result, "pages", None):
+    if result.pages:
         for page in result.pages:
-            if getattr(page, "lines", None):
+            if page.lines:
                 for line in page.lines:
-                    content = getattr(line, "content", None)
-                    if content:
-                        lines.append(content)
+                    if line.content:
+                        lines.append(line.content)
 
     return "\n".join(lines).strip()
 
 
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    """
+    Try to parse JSON. If the model returns extra text, extract the first {...} block.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty OpenAI response")
+
+    # First try direct JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Fallback: find first '{' and last '}' and parse that slice
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("OpenAI did not return JSON")
+
+    return json.loads(text[start : end + 1])
+
+
 def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
-    # If OpenAI is not installed or key missing, return a simple stub
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or OpenAI is None:
         return {
@@ -71,7 +91,7 @@ def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
             "rawText": ocr_text,
         }
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # set in Railway Variables
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     client = OpenAI(api_key=api_key)
 
     prompt = f"""
@@ -111,7 +131,14 @@ Your job:
       "sd": null|number, "numCells": null|number, "pachy": null|number,
       "blocks": []
     }},
-    "OS": {{ same keys as OD }},
+    "OS": {{
+      "AL": null|number, "K1": null|number, "K2": null|number, "ACD": null|number,
+      "LT": null|number, "WTW": null|number, "CCT": null|number,
+      "ecc": null|number, "cv": null|number, "hex": null|number,
+      "avgCellSize": null|number, "maxCellSize": null|number, "minCellSize": null|number,
+      "sd": null|number, "numCells": null|number, "pachy": null|number,
+      "blocks": []
+    }},
     "efx": null|string,
     "ust": null|string,
     "avg": null|string
@@ -125,6 +152,7 @@ Rules:
 - If phacoSummary, fill efx/ust/avg in fields (global/OD/OS can stay mostly null).
 - If biometry, blocks can be included if you see IOL tables. Otherwise empty array.
 - Be conservative: don't guess.
+- Output JSON only.
 
 OCR TEXT:
 \"\"\"
@@ -132,16 +160,18 @@ OCR TEXT:
 \"\"\"
 """.strip()
 
+    # IMPORTANT: do NOT pass response_format here (your installed OpenAI lib rejected it)
     resp = client.responses.create(
         model=model,
         input=prompt,
-        response_format={"type": "json_object"},
     )
 
-    out_text = resp.output_text
+    out_text = getattr(resp, "output_text", None)
+    if not out_text:
+        # Extra safety fallback
+        out_text = str(resp)
 
-    import json
-    return json.loads(out_text)
+    return _extract_json_object(out_text)
 
 
 @app.post("/extract")
@@ -152,6 +182,7 @@ async def extract(file: UploadFile = File(...)):
             return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
 
         ocr_text = ocr_with_azure_di(file_bytes, file.content_type or "application/octet-stream")
+
         if not ocr_text:
             return {
                 "success": True,

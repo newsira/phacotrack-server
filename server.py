@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
 
-# OpenAI (optional – only used if OPENAI_API_KEY is set)
 try:
     from openai import OpenAI
 except Exception:
@@ -20,16 +19,11 @@ except Exception:
 app = FastAPI()
 
 
-def env(name: str) -> str:
+def must_env(name: str) -> str:
     v = os.getenv(name)
-    if not v:
+    if v is None or v == "":
         raise RuntimeError(f"Missing environment variable: {name}")
     return v
-
-
-@app.get("/")
-def root():
-    return {"status": "server running"}
 
 
 def normalize_endpoint(raw: str) -> str:
@@ -39,34 +33,38 @@ def normalize_endpoint(raw: str) -> str:
     return v
 
 
+def normalize_key(raw: str) -> str:
+    """
+    Remove ALL whitespace (including unicode separators/newlines) from secrets.
+    This prevents 'ascii codec can't encode' crashes in HTTP headers.
+    """
+    if not raw:
+        return ""
+    raw = unicodedata.normalize("NFC", raw)
+    # remove any whitespace char: spaces, tabs, newlines, \u2028, \u2029, etc.
+    return re.sub(r"\s+", "", raw).strip()
+
+
 def sanitize_text(s: str) -> str:
-    """
-    Remove problematic unicode/control characters that can crash some HTTP stacks
-    when they try to encode text as ASCII (e.g. U+2028 / U+2029).
-    """
     if not s:
         return ""
     s = unicodedata.normalize("NFC", s)
-
-    # Replace common “line separator” / “paragraph separator” with normal newline
     s = s.replace("\u2028", "\n").replace("\u2029", "\n")
-
-    # Remove ASCII control chars + C1 controls
     s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", s)
-
-    # Remove BOM/zero-width stuff
     s = s.replace("\ufeff", "").replace("\u200b", "")
-
-    # Collapse weird whitespace
     s = re.sub(r"[ \t\r\f\v]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-
     return s.strip()
 
 
+@app.get("/")
+def root():
+    return {"status": "server running"}
+
+
 def ocr_with_azure_di(file_bytes: bytes) -> str:
-    endpoint = normalize_endpoint(env("AZURE_DI_ENDPOINT"))
-    key = env("AZURE_DI_KEY").strip()
+    endpoint = normalize_endpoint(must_env("AZURE_DI_ENDPOINT"))
+    key = normalize_key(must_env("AZURE_DI_KEY"))
 
     client = DocumentAnalysisClient(
         endpoint=endpoint,
@@ -91,7 +89,9 @@ def ocr_with_azure_di(file_bytes: bytes) -> str:
 
 
 def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key_raw = os.getenv("OPENAI_API_KEY", "")
+    api_key = normalize_key(api_key_raw)
+
     if not api_key or OpenAI is None:
         return {
             "success": True,
@@ -101,10 +101,9 @@ def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
             "rawText": ocr_text,
         }
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    model = (os.getenv("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini").strip()
     client = OpenAI(api_key=api_key)
 
-    # extra safety: sanitize again before prompting
     ocr_text = sanitize_text(ocr_text)
 
     prompt = f"""
@@ -170,7 +169,6 @@ OCR TEXT:
 \"\"\"
 """.strip()
 
-    # Responses API (preferred)
     try:
         resp = client.responses.create(
             model=model,
@@ -179,7 +177,6 @@ OCR TEXT:
         )
         return json.loads(resp.output_text)
     except Exception:
-        # Fallback: chat.completions
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],

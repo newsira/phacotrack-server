@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -33,24 +33,28 @@ def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
     endpoint = env("AZURE_DI_ENDPOINT")
     key = env("AZURE_DI_KEY")
 
-    client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+    client = DocumentIntelligenceClient(
+        endpoint=endpoint,
+        credential=AzureKeyCredential(key),
+    )
 
-    # IMPORTANT: body=... is required (this was your crash)
+    # Use positional body argument to avoid SDK keyword mismatch issues.
     poller = client.begin_analyze_document(
         "prebuilt-read",
-        body=file_bytes,
+        file_bytes,
         content_type=content_type or "application/octet-stream",
     )
     result = poller.result()
 
     lines = []
     # Extract all text lines in reading order
-    if result.pages:
+    if getattr(result, "pages", None):
         for page in result.pages:
-            if page.lines:
+            if getattr(page, "lines", None):
                 for line in page.lines:
-                    if line.content:
-                        lines.append(line.content)
+                    content = getattr(line, "content", None)
+                    if content:
+                        lines.append(content)
 
     return "\n".join(lines).strip()
 
@@ -67,7 +71,7 @@ def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
             "rawText": ocr_text,
         }
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # you can change in Railway Variables
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # set in Railway Variables
     client = OpenAI(api_key=api_key)
 
     prompt = f"""
@@ -128,16 +132,14 @@ OCR TEXT:
 \"\"\"
 """.strip()
 
-    # Use Responses API
     resp = client.responses.create(
         model=model,
         input=prompt,
         response_format={"type": "json_object"},
     )
 
-    # SDK returns JSON as a string in output_text
     out_text = resp.output_text
-    # Let FastAPI return it as JSON (it's already JSON text)
+
     import json
     return json.loads(out_text)
 
@@ -151,7 +153,12 @@ async def extract(file: UploadFile = File(...)):
 
         ocr_text = ocr_with_azure_di(file_bytes, file.content_type or "application/octet-stream")
         if not ocr_text:
-            return {"success": True, "documentType": "unknown", "fields": {"global": {}, "OD": {}, "OS": {}}, "warnings": ["No OCR text found"]}
+            return {
+                "success": True,
+                "documentType": "unknown",
+                "fields": {"global": {}, "OD": {}, "OS": {}},
+                "warnings": ["No OCR text found"],
+            }
 
         parsed = call_openai_to_json(ocr_text)
         return parsed

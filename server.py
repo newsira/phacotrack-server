@@ -35,10 +35,6 @@ def normalize_endpoint(raw: str) -> str:
 
 
 def normalize_key(raw: str) -> str:
-    """
-    Remove ALL whitespace (including unicode separators/newlines) from secrets.
-    Prevents weird header / ascii crashes if key got pasted with hidden chars.
-    """
     if not raw:
         return ""
     raw = unicodedata.normalize("NFC", raw)
@@ -63,10 +59,6 @@ def root():
 
 
 def _polygon_center_x(polygon: List[Dict[str, float]]) -> Optional[float]:
-    """
-    polygon looks like: [{"x":..., "y":...}, ...]
-    Return average x.
-    """
     if not polygon:
         return None
     xs = [p.get("x") for p in polygon if isinstance(p, dict) and p.get("x") is not None]
@@ -75,27 +67,15 @@ def _polygon_center_x(polygon: List[Dict[str, float]]) -> Optional[float]:
     return sum(xs) / float(len(xs))
 
 
-def _page_width(result, page_number_1based: int) -> Optional[float]:
-    pages = getattr(result, "pages", None) or []
-    for p in pages:
-        if getattr(p, "page_number", None) == page_number_1based:
-            return getattr(p, "width", None)
-    return None
-
-
 def _table_to_matrix(table) -> List[List[str]]:
-    """
-    Convert Azure table cells into a 2D matrix [row][col] of strings.
-    """
     row_count = int(getattr(table, "row_count", 0) or 0)
     col_count = int(getattr(table, "column_count", 0) or 0)
-
     if row_count <= 0 or col_count <= 0:
         return []
 
     grid: List[List[str]] = [["" for _ in range(col_count)] for _ in range(row_count)]
-
     cells = getattr(table, "cells", None) or []
+
     for c in cells:
         r = getattr(c, "row_index", None)
         k = getattr(c, "column_index", None)
@@ -103,14 +83,11 @@ def _table_to_matrix(table) -> List[List[str]]:
         if r is None or k is None:
             continue
         if 0 <= r < row_count and 0 <= k < col_count:
-            # Sometimes same cell appears twice; keep the longer content
             if len(txt.strip()) > len(grid[r][k].strip()):
                 grid[r][k] = txt.strip()
 
-    # Trim trailing empty columns per row (but keep at least 2 cols if present)
     out: List[List[str]] = []
     for row in grid:
-        # remove trailing empty
         while len(row) > 0 and row[-1].strip() == "":
             row.pop()
         out.append(row)
@@ -118,13 +95,36 @@ def _table_to_matrix(table) -> List[List[str]]:
     return out
 
 
-def extract_text_and_tables_by_eye(file_bytes: bytes) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _compute_split_x(table_centers: List[float]) -> Optional[float]:
     """
-    Use Azure DI (prebuilt-layout) to get:
-    - text lines
-    - tables + coordinates
-    Then split tables into OD (left) vs OS (right) using page width midpoint.
+    Robust split without relying on page.width.
+    If we have multiple tables, take median and split around it.
     """
+    if not table_centers:
+        return None
+    if len(table_centers) == 1:
+        return None
+
+    xs = sorted(table_centers)
+    mid = len(xs) // 2
+    if len(xs) % 2 == 1:
+        median = xs[mid]
+    else:
+        median = (xs[mid - 1] + xs[mid]) / 2.0
+
+    # We want a divider between left-cluster and right-cluster.
+    # Use midpoint between max(left) and min(right) around the median.
+    left = [x for x in xs if x <= median]
+    right = [x for x in xs if x > median]
+
+    if not right or not left:
+        # fallback: just use median as divider
+        return median
+
+    return (max(left) + min(right)) / 2.0
+
+
+def extract_text_and_tables_split_by_eye(file_bytes: bytes) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
     endpoint = normalize_endpoint(must_env("AZURE_DI_ENDPOINT"))
     key = normalize_key(must_env("AZURE_DI_KEY"))
 
@@ -136,50 +136,71 @@ def extract_text_and_tables_by_eye(file_bytes: bytes) -> Tuple[str, List[Dict[st
     )
     result = poller.result()
 
-    # ---- Text (for headers like patient name, HN, exam date, etc.)
+    # ---- OCR text lines (headers)
     lines_out: List[str] = []
     pages = getattr(result, "pages", None) or []
     for page in pages:
-        page_lines = getattr(page, "lines", None) or []
-        for line in page_lines:
+        for line in (getattr(page, "lines", None) or []):
             content = getattr(line, "content", None)
             if content:
                 lines_out.append(content)
-
     full_text = sanitize_text("\n".join(lines_out))
 
-    # ---- Tables split by left/right
-    od_tables: List[Dict[str, Any]] = []
-    os_tables: List[Dict[str, Any]] = []
-
+    # ---- Gather tables with centerX + page number first
+    raw_tables: List[Dict[str, Any]] = []
     tables = getattr(result, "tables", None) or []
     for idx, t in enumerate(tables, start=1):
-        # bounding_regions: list of regions, each has page_number + polygon
         regions = getattr(t, "bounding_regions", None) or []
         if not regions:
             continue
-
-        region0 = regions[0]
-        page_num = getattr(region0, "page_number", None)  # 1-based
-        polygon = getattr(region0, "polygon", None) or []
-        center_x = _polygon_center_x(polygon)
-
-        width = _page_width(result, page_num) if page_num else None
-        if width is None or center_x is None:
-            # If no geometry, don't guess: put into "unassigned" bucket by treating as OD for now? better: skip.
+        r0 = regions[0]
+        page_num = getattr(r0, "page_number", None)  # 1-based
+        polygon = getattr(r0, "polygon", None) or []
+        cx = _polygon_center_x(polygon)
+        if page_num is None or cx is None:
             continue
 
-        side = "left" if center_x < (float(width) / 2.0) else "right"
-        matrix = _table_to_matrix(t)
+        raw_tables.append(
+            {
+                "index": idx,
+                "page": int(page_num),
+                "centerX": float(cx),
+                "matrix": _table_to_matrix(t),
+            }
+        )
+
+    # ---- Compute split per page using table centerXs
+    page_to_centers: Dict[int, List[float]] = {}
+    for t in raw_tables:
+        page_to_centers.setdefault(t["page"], []).append(t["centerX"])
+
+    page_to_split: Dict[int, Optional[float]] = {}
+    for page, centers in page_to_centers.items():
+        page_to_split[page] = _compute_split_x(centers)
+
+    # ---- Assign OD/OS based on split
+    od_tables: List[Dict[str, Any]] = []
+    os_tables: List[Dict[str, Any]] = []
+
+    for t in raw_tables:
+        split_x = page_to_split.get(t["page"])
+        if split_x is None:
+            # If only 1 table on page (rare), don't guess -> treat as unassigned by putting in OD? better: keep in OD AND warn via logs.
+            side = "left"
+        else:
+            side = "left" if t["centerX"] < split_x else "right"
 
         table_obj = {
-            "index": idx,
-            "page": page_num,
+            "index": t["index"],
+            "page": t["page"],
             "side": side,
-            "centerX": center_x,
-            "pageWidth": width,
-            "matrix": matrix
+            "centerX": t["centerX"],
+            "splitX": split_x,
+            "matrix": t["matrix"],
         }
+
+        # Helpful debug in Railway logs (safe)
+        print(f"[TABLE] idx={t['index']} page={t['page']} centerX={t['centerX']:.4f} splitX={split_x} side={side}")
 
         if side == "left":
             od_tables.append(table_obj)
@@ -198,49 +219,31 @@ def call_openai_to_json(ocr_text: str, od_tables: List[Dict[str, Any]], os_table
             "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None},
             "warnings": ["OPENAI_API_KEY not set (returning OCR only)"],
             "rawText": ocr_text,
-            "tables": {"OD": od_tables, "OS": os_tables},
         }
 
     model = (os.getenv("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini").strip()
     client = OpenAI(api_key=api_key)
 
-    ocr_text = sanitize_text(ocr_text)
-
-    # We feed OpenAI BOTH text + tables, already grouped by eye using Azure coordinates.
-    # Rule: DO NOT move tables between eyes.
     payload = {
-        "ocrText": ocr_text,
-        "tablesByEye": {
-            "OD": od_tables,
-            "OS": os_tables
-        },
-        "importantRule": "OD tables come from LEFT side of page, OS tables come from RIGHT side of page. Do NOT swap them."
+        "ocrText": sanitize_text(ocr_text),
+        "tablesByEye": {"OD": od_tables, "OS": os_tables},
+        "rule": "OD tables are LEFT side. OS tables are RIGHT side. Do not swap.",
     }
 
     prompt = f"""
 You are a careful ophthalmology document parser.
 
-You will receive:
-1) OCR text (headers + general text)
-2) Tables already grouped by eye using Azure table coordinates:
-   - tablesByEye.OD = LEFT side of page (OD)
-   - tablesByEye.OS = RIGHT side of page (OS)
+You receive:
+- OCR text (headers)
+- Tables grouped by eye using table coordinates:
+  - OD = LEFT side
+  - OS = RIGHT side
 
-CRITICAL RULE:
-- DO NOT move any table from OD to OS or OS to OD.
-- If a table cannot be interpreted, leave it out (do not guess).
+CRITICAL:
+- Do NOT move a table from OD to OS or OS to OD.
+- If you cannot confidently interpret a table, skip it (do not guess).
 
-Your job:
-A) Choose documentType as ONE of:
-   - opticalBiometry
-   - immersionBiometry
-   - ecc
-   - autokeratometry
-   - phacoSummary
-   - clinicNote
-   - unknown
-
-B) Output STRICT JSON only (no extra text) in this exact shape:
+Return STRICT JSON only with this shape:
 
 {{
   "success": true,
@@ -262,7 +265,7 @@ B) Output STRICT JSON only (no extra text) in this exact shape:
       "sd": null|number, "numCells": null|number, "pachy": null|number,
       "blocks": [
         {{
-          "blockIndex": "string",          // e.g. lens name or '1','2','3','4'
+          "blockIndex": "string",
           "AConstant": "string|null",
           "Formula": "string|null",
           "rows": [{{"iolPower": number, "targetRefraction": number}}]
@@ -277,24 +280,26 @@ B) Output STRICT JSON only (no extra text) in this exact shape:
   "warnings": []
 }}
 
+DocumentType must be one of:
+- opticalBiometry
+- immersionBiometry
+- ecc
+- autokeratometry
+- phacoSummary
+- clinicNote
+- unknown
+
 Rules:
 - Use null when unknown.
-- Numbers must be numbers (not strings).
-- For optical/immersion biometry:
-  - Extract AL, K1, K2, ACD (and others if present) for OD and OS.
-  - Extract ALL IOL target tables you can find from the provided tablesByEye matrices.
-  - Each eye may have multiple blocks.
-- For ECC:
-  - Put ECC values into OD/OS ecc/cv/hex etc.
-- For phacoSummary:
-  - Fill efx/ust/avg only; keep OD/OS mostly null.
-- Be conservative. No guessing.
+- Numbers must be numbers.
+- If optical/immersion biometry and you see IOL target tables, extract them into blocks.
+- If you see Formula (e.g., SRK/T, SRK®/T), fill it; otherwise null.
+- If phacoSummary, fill efx/ust/avg and leave blocks empty.
 
-INPUT (JSON):
+INPUT JSON:
 {json.dumps(payload, ensure_ascii=False)}
 """.strip()
 
-    # Prefer Responses API with json_object formatting
     try:
         resp = client.responses.create(
             model=model,
@@ -303,7 +308,6 @@ INPUT (JSON):
         )
         return json.loads(resp.output_text)
     except Exception:
-        # fallback
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -319,9 +323,8 @@ async def extract(file: UploadFile = File(...)):
         if not file_bytes:
             return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
 
-        ocr_text, od_tables, os_tables = extract_text_and_tables_by_eye(file_bytes)
+        ocr_text, od_tables, os_tables = extract_text_and_tables_split_by_eye(file_bytes)
 
-        # If absolutely no text and no tables, return unknown
         if not ocr_text and not od_tables and not os_tables:
             return {
                 "success": True,

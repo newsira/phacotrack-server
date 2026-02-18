@@ -20,6 +20,9 @@ except Exception:
 app = FastAPI()
 
 
+# -------------------------
+# Utilities
+# -------------------------
 def must_env(name: str) -> str:
     v = os.getenv(name)
     if v is None or v == "":
@@ -35,6 +38,10 @@ def normalize_endpoint(raw: str) -> str:
 
 
 def normalize_key(raw: str) -> str:
+    """
+    Remove ALL whitespace (including unicode separators/newlines) from secrets.
+    Prevents header encoding crashes.
+    """
     if not raw:
         return ""
     raw = unicodedata.normalize("NFC", raw)
@@ -53,193 +60,211 @@ def sanitize_text(s: str) -> str:
     return s.strip()
 
 
-def env_bool(name: str) -> bool:
-    v = (os.getenv(name, "") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+def polygon_center_xy(polygon: Optional[List[Any]]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    polygon comes from azure form recognizer: list of Points (x,y)
+    Return center (avg x, avg y).
+    """
+    if not polygon:
+        return (None, None)
+    xs = []
+    ys = []
+    for p in polygon:
+        x = getattr(p, "x", None)
+        y = getattr(p, "y", None)
+        if x is None or y is None:
+            continue
+        xs.append(float(x))
+        ys.append(float(y))
+    if not xs or not ys:
+        return (None, None)
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
+def polygon_bbox(polygon: Optional[List[Any]]) -> Optional[Dict[str, float]]:
+    if not polygon:
+        return None
+    xs = []
+    ys = []
+    for p in polygon:
+        x = getattr(p, "x", None)
+        y = getattr(p, "y", None)
+        if x is None or y is None:
+            continue
+        xs.append(float(x))
+        ys.append(float(y))
+    if not xs or not ys:
+        return None
+    return {"minX": min(xs), "minY": min(ys), "maxX": max(xs), "maxY": max(ys)}
+
+
+# -------------------------
+# Health
+# -------------------------
 @app.get("/")
 def root():
     return {"status": "server running"}
 
 
-def _polygon_center_x(polygon) -> Optional[float]:
-    if not polygon:
-        return None
-    xs = []
-    for p in polygon:
-        if hasattr(p, "x") and p.x is not None:
-            xs.append(float(p.x))
-        elif isinstance(p, dict) and p.get("x") is not None:
-            xs.append(float(p["x"]))
-    if not xs:
-        return None
-    return sum(xs) / float(len(xs))
-
-
-def _table_to_matrix(table) -> List[List[str]]:
-    row_count = int(getattr(table, "row_count", 0) or 0)
-    col_count = int(getattr(table, "column_count", 0) or 0)
-    if row_count <= 0 or col_count <= 0:
-        return []
-
-    grid: List[List[str]] = [["" for _ in range(col_count)] for _ in range(row_count)]
-    cells = getattr(table, "cells", None) or []
-
-    for c in cells:
-        r = getattr(c, "row_index", None)
-        k = getattr(c, "column_index", None)
-        txt = getattr(c, "content", None) or ""
-        if r is None or k is None:
-            continue
-        if 0 <= r < row_count and 0 <= k < col_count:
-            t = txt.strip()
-            if len(t) > len(grid[r][k].strip()):
-                grid[r][k] = t
-
-    out: List[List[str]] = []
-    for row in grid:
-        while len(row) > 0 and row[-1].strip() == "":
-            row.pop()
-        out.append(row)
-
-    return out
-
-
-def extract_text_and_tables_half_split(file_bytes: bytes) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+# -------------------------
+# Azure DI (prebuilt-layout)
+# -------------------------
+def analyze_layout_with_azure_di(file_bytes: bytes) -> Dict[str, Any]:
     """
-    Uses Azure prebuilt-layout.
-    Splits page into halves using page.width:
-      - LEFT half -> OD (right eye)
-      - RIGHT half -> OS (left eye)
+    Returns a compact, geometry-aware payload:
+    - pageWidth/pageHeight (page 1)
+    - midX (pageWidth / 2)
+    - headerLines: line text + (cx, cy)
+    - tables: each table with side (OD/OS), bbox, center, and all cells (row, col, text)
     """
     endpoint = normalize_endpoint(must_env("AZURE_DI_ENDPOINT"))
     key = normalize_key(must_env("AZURE_DI_KEY"))
 
     client = DocumentAnalysisClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
-    poller = client.begin_analyze_document(
-        model_id="prebuilt-layout",
-        document=file_bytes,
-    )
+    poller = client.begin_analyze_document(model_id="prebuilt-layout", document=file_bytes)
     result = poller.result()
 
-    # OCR text (useful for patient name, dates, etc.)
-    lines_out: List[str] = []
+    # We assume single-page images for your use case (phone photo of one sheet).
+    # If multi-page ever appears, we still label items by pageNumber.
     pages = getattr(result, "pages", None) or []
-    for page in pages:
-        for line in (getattr(page, "lines", None) or []):
-            content = getattr(line, "content", None)
-            if content:
-                lines_out.append(content)
-    full_text = sanitize_text("\n".join(lines_out))
+    first_page = pages[0] if pages else None
 
-    # Map page_number -> page_width (same unit as polygons)
-    page_width: Dict[int, float] = {}
-    page_unit: Dict[int, str] = {}
-    for p in pages:
-        pn = int(getattr(p, "page_number", 0) or 0)
-        w = getattr(p, "width", None)
-        u = getattr(p, "unit", None)
-        if pn and w is not None:
-            page_width[pn] = float(w)
-            page_unit[pn] = str(u) if u is not None else ""
+    page_width = float(getattr(first_page, "width", 0.0) or 0.0)
+    page_height = float(getattr(first_page, "height", 0.0) or 0.0)
+    mid_x = page_width / 2.0 if page_width else None
 
-    od_tables: List[Dict[str, Any]] = []
-    os_tables: List[Dict[str, Any]] = []
+    header_lines: List[Dict[str, Any]] = []
+    if first_page and getattr(first_page, "lines", None):
+        for ln in first_page.lines:
+            txt = sanitize_text(getattr(ln, "content", "") or "")
+            if not txt:
+                continue
+            poly = getattr(ln, "polygon", None)
+            cx, cy = polygon_center_xy(poly)
+            header_lines.append(
+                {
+                    "text": txt,
+                    "cx": cx,
+                    "cy": cy,
+                }
+            )
 
+    tables_out: List[Dict[str, Any]] = []
     tables = getattr(result, "tables", None) or []
-    for idx, t in enumerate(tables, start=1):
-        regions = getattr(t, "bounding_regions", None) or []
-        if not regions:
+    for ti, t in enumerate(tables):
+        # Determine table page + polygon
+        # table.bounding_regions is a list, each has page_number + polygon
+        brs = getattr(t, "bounding_regions", None) or []
+        if not brs:
             continue
 
-        r0 = regions[0]
-        pn = int(getattr(r0, "page_number", 0) or 0)
-        polygon = getattr(r0, "polygon", None) or []
-        cx = _polygon_center_x(polygon)
-        if pn <= 0 or cx is None:
+        # If multiple regions, use the first for side calculation
+        br0 = brs[0]
+        page_num = int(getattr(br0, "page_number", 1) or 1)
+        poly = getattr(br0, "polygon", None)
+        bbox = polygon_bbox(poly)
+        cx, cy = polygon_center_xy(poly)
+
+        side = "unknown"
+        if mid_x is not None and cx is not None:
+            side = "OD" if cx < mid_x else "OS"
+
+        cells_out: List[Dict[str, Any]] = []
+        cells = getattr(t, "cells", None) or []
+        for c in cells:
+            text = sanitize_text(getattr(c, "content", "") or "")
+            if text == "":
+                continue
+            row = int(getattr(c, "row_index", 0) or 0)
+            col = int(getattr(c, "column_index", 0) or 0)
+            kind = getattr(c, "kind", None)  # may be "columnHeader"/"rowHeader"/"content"
+            cells_out.append(
+                {
+                    "row": row,
+                    "col": col,
+                    "text": text,
+                    "kind": kind,
+                }
+            )
+
+        # Skip tables that have no useful text
+        if not cells_out:
             continue
 
-        w = page_width.get(pn)
-        if w is None:
-            # If we can't get page width, we cannot do half split safely.
-            continue
+        tables_out.append(
+            {
+                "tableId": ti + 1,
+                "pageNumber": page_num,
+                "side": side,
+                "center": {"x": cx, "y": cy},
+                "bbox": bbox,
+                "rowCount": int(getattr(t, "row_count", 0) or 0),
+                "colCount": int(getattr(t, "column_count", 0) or 0),
+                "cells": cells_out,
+            }
+        )
 
-        half = w / 2.0
-        side = "left" if cx < half else "right"
+    # Sort tables top-to-bottom within each side (helps OpenAI)
+    def sort_key(tbl: Dict[str, Any]) -> float:
+        c = tbl.get("center") or {}
+        y = c.get("y")
+        return float(y) if y is not None else 1e9
 
-        table_obj = {
-            "index": idx,
-            "page": pn,
-            "pageWidth": w,
-            "unit": page_unit.get(pn, ""),
-            "centerX": float(cx),
-            "side": side,
-            "matrix": _table_to_matrix(t),
-        }
+    tables_out.sort(key=sort_key)
 
-        # Print debug in Railway logs
-        print(f"[TABLE] idx={idx} page={pn} width={w} cx={cx:.4f} half={half:.4f} side={side}")
-
-        if side == "left":
-            od_tables.append(table_obj)
-        else:
-            os_tables.append(table_obj)
-
-    debug_info = {
-        "tablesTotal": len(tables),
-        "tablesCaptured": len(od_tables) + len(os_tables),
-        "odTables": len(od_tables),
-        "osTables": len(os_tables),
-        "pagesWithWidth": list(page_width.keys()),
+    payload = {
+        "page": {
+            "width": page_width,
+            "height": page_height,
+            "midX": mid_x,
+        },
+        "headerLines": header_lines,
+        "tables": tables_out,
     }
 
-    return full_text, od_tables, os_tables, debug_info
+    return payload
 
 
-def call_openai_to_json(ocr_text: str, od_tables: List[Dict[str, Any]], os_tables: List[Dict[str, Any]], debug_info: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = normalize_key(os.getenv("OPENAI_API_KEY", "") or "")
+# -------------------------
+# OpenAI parsing (AI reads structured payload, but OD/OS is already decided)
+# -------------------------
+def call_openai_to_json(layout_payload: Dict[str, Any]) -> Dict[str, Any]:
+    api_key = normalize_key(os.getenv("OPENAI_API_KEY", ""))
     if not api_key or OpenAI is None:
-        out = {
+        return {
             "success": True,
             "documentType": "unknown",
             "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None},
-            "warnings": ["OPENAI_API_KEY not set (returning OCR only)"],
-            "rawText": ocr_text,
+            "warnings": ["OPENAI_API_KEY not set (returning layout payload only)"],
+            "layoutPayload": layout_payload,
         }
-        if env_bool("DEBUG"):
-            out["debug"] = debug_info
-            out["debug"]["note"] = "No OpenAI key; tables were not parsed to JSON."
-        return out
 
     model = (os.getenv("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini").strip()
     client = OpenAI(api_key=api_key)
 
-    payload = {
-        "ocrText": sanitize_text(ocr_text),
-        "tablesByEye": {
-            "OD": od_tables,  # LEFT half of page
-            "OS": os_tables,  # RIGHT half of page
-        },
-        "rule": "DO NOT swap tables. OD is LEFT half. OS is RIGHT half.",
-    }
+    # Keep payload smaller/safer
+    payload_json = json.dumps(layout_payload, ensure_ascii=False)
 
     prompt = f"""
-You are a careful ophthalmology document parser.
+You are a medical document parser for ophthalmology clinic documents.
 
-You receive:
-- OCR text
-- Tables grouped by eye using page halves:
-  - OD (right eye) = LEFT half of page
-  - OS (left eye)  = RIGHT half of page
+You will receive a STRUCTURED payload extracted by Azure Document Intelligence prebuilt-layout.
+IMPORTANT: OD/OS assignment is already done deterministically by the backend:
+- tables[].side == "OD" means RIGHT EYE tables (left half of page)
+- tables[].side == "OS" means LEFT EYE tables (right half of page)
 
-CRITICAL:
-- Do NOT move a table from OD to OS or OS to OD.
-- If you cannot read a table clearly, SKIP it (do not guess).
-- If there are no tables, blocks must be [].
+Your job:
+1) Decide documentType as ONE of:
+   - opticalBiometry
+   - immersionBiometry
+   - ecc
+   - autokeratometry
+   - phacoSummary
+   - clinicNote
+   - unknown
 
-Return STRICT JSON only with this shape:
+2) Output STRICT JSON only (no extra text) with this exact shape:
 
 {{
   "success": true,
@@ -259,16 +284,16 @@ Return STRICT JSON only with this shape:
       "ecc": null|number, "cv": null|number, "hex": null|number,
       "avgCellSize": null|number, "maxCellSize": null|number, "minCellSize": null|number,
       "sd": null|number, "numCells": null|number, "pachy": null|number,
-      "blocks": [
-        {{
-          "blockIndex": "string",
-          "AConstant": "string|null",
-          "Formula": "string|null",
-          "rows": [{{"iolPower": number, "targetRefraction": number}}]
-        }}
-      ]
+      "blocks": []
     }},
-    "OS": {{ same keys as OD }},
+    "OS": {{
+      "AL": null|number, "K1": null|number, "K2": null|number, "ACD": null|number,
+      "LT": null|number, "WTW": null|number, "CCT": null|number,
+      "ecc": null|number, "cv": null|number, "hex": null|number,
+      "avgCellSize": null|number, "maxCellSize": null|number, "minCellSize": null|number,
+      "sd": null|number, "numCells": null|number, "pachy": null|number,
+      "blocks": []
+    }},
     "efx": null|string,
     "ust": null|string,
     "avg": null|string
@@ -276,17 +301,23 @@ Return STRICT JSON only with this shape:
   "warnings": []
 }}
 
-documentType must be one of:
-- opticalBiometry
-- immersionBiometry
-- ecc
-- autokeratometry
-- phacoSummary
-- clinicNote
-- unknown
+Rules (strict):
+- Use null when unknown. Do NOT guess.
+- Numbers must be real numbers (no commas, no stray characters).
+- Use headerLines for patient demographics and global info (name/HN/date/machine/formula if global).
+- Use tables for IOL blocks and any tabular values.
+- IOL blocks: each block should contain:
+  - blockIndex: "1"/"2"/"3"/"4" in top-to-bottom order WITHIN EACH SIDE (OD separately from OS)
+  - AConstant: extract from table text like "A const: 119.00"
+  - Formula: if clearly found as global formula (e.g. "Formula: SRK/T" in headerLines), apply it to all blocks.
+            If formula is clearly inside the table, use that.
+            If unclear, set null.
+  - rows: list of {{ "iolPower": number, "targetRefraction": number }} from the table columns (IOL(D) and REF(D)).
+- Do not merge OD and OS blocks. OD blocks come only from tables where side=="OD". OS blocks only from side=="OS".
+- If you cannot confidently interpret a table as an IOL block, ignore it and add a warning.
 
-INPUT JSON:
-{json.dumps(payload, ensure_ascii=False)}
+INPUT PAYLOAD (JSON):
+{payload_json}
 """.strip()
 
     try:
@@ -295,40 +326,20 @@ INPUT JSON:
             input=prompt,
             response_format={"type": "json_object"},
         )
-        out = json.loads(resp.output_text)
+        return json.loads(resp.output_text)
     except Exception:
+        # Fallback for older SDK surfaces
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
-        out = json.loads(resp.choices[0].message.content)
-
-    if env_bool("DEBUG"):
-        out["debug"] = debug_info
-        out["debug"]["odTablesSent"] = len(od_tables)
-        out["debug"]["osTablesSent"] = len(os_tables)
-
-        # Small preview so you can see if Azure even detected the tables
-        def _preview(tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            pv = []
-            for t in tables[:2]:
-                m = t.get("matrix") or []
-                pv.append({
-                    "index": t.get("index"),
-                    "page": t.get("page"),
-                    "side": t.get("side"),
-                    "centerX": t.get("centerX"),
-                    "matrixFirst2Rows": m[:2],
-                })
-            return pv
-
-        out["debug"]["odPreview"] = _preview(od_tables)
-        out["debug"]["osPreview"] = _preview(os_tables)
-
-    return out
+        return json.loads(resp.choices[0].message.content)
 
 
+# -------------------------
+# API
+# -------------------------
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     try:
@@ -336,21 +347,18 @@ async def extract(file: UploadFile = File(...)):
         if not file_bytes:
             return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
 
-        ocr_text, od_tables, os_tables, debug_info = extract_text_and_tables_half_split(file_bytes)
+        layout_payload = analyze_layout_with_azure_di(file_bytes)
 
-        # If Azure detected no tables, this will explain why blocks are empty.
-        if not ocr_text and not od_tables and not os_tables:
-            out = {
+        # If Azure returned nothing useful, return unknown
+        if not layout_payload.get("headerLines") and not layout_payload.get("tables"):
+            return {
                 "success": True,
                 "documentType": "unknown",
                 "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None},
-                "warnings": ["No OCR text or tables found"],
+                "warnings": ["No text/tables found by Azure layout"],
             }
-            if env_bool("DEBUG"):
-                out["debug"] = debug_info
-            return out
 
-        return call_openai_to_json(ocr_text, od_tables, os_tables, debug_info)
+        return call_openai_to_json(layout_payload)
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})

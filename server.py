@@ -6,8 +6,6 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 
 from azure.core.credentials import AzureKeyCredential
-
-# ✅ Use the stable OCR SDK (works reliably with "prebuilt-read")
 from azure.ai.formrecognizer import DocumentAnalysisClient
 
 # OpenAI (optional – only used if OPENAI_API_KEY is set)
@@ -33,14 +31,13 @@ def root():
 
 
 def normalize_endpoint(raw: str) -> str:
-    # Remove hidden spaces/newlines + ensure https + no double slashes
     v = (raw or "").strip()
     if v.endswith("/"):
         v = v[:-1]
     return v
 
 
-def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
+def ocr_with_azure_di(file_bytes: bytes) -> str:
     endpoint = normalize_endpoint(env("AZURE_DI_ENDPOINT"))
     key = env("AZURE_DI_KEY").strip()
 
@@ -49,11 +46,9 @@ def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
         credential=AzureKeyCredential(key),
     )
 
-    # Stable call: "prebuilt-read" OCR
     poller = client.begin_analyze_document(
         model_id="prebuilt-read",
-        document=file_bytes,
-        content_type=content_type or "application/octet-stream",
+        document=file_bytes,  # ✅ don't pass content_type here (fixes your error)
     )
     result = poller.result()
 
@@ -145,24 +140,22 @@ OCR TEXT:
 \"\"\"
 """.strip()
 
-    # Try Responses API first (new OpenAI SDK)
+    # Responses API (preferred)
     try:
         resp = client.responses.create(
             model=model,
             input=prompt,
             response_format={"type": "json_object"},
         )
-        out_text = resp.output_text
-        return json.loads(out_text)
+        return json.loads(resp.output_text)
     except Exception:
-        # Fallback: Chat Completions API (older compatibility)
+        # Fallback: chat.completions
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
-        out_text = resp.choices[0].message.content
-        return json.loads(out_text)
+        return json.loads(resp.choices[0].message.content)
 
 
 @app.post("/extract")
@@ -172,7 +165,7 @@ async def extract(file: UploadFile = File(...)):
         if not file_bytes:
             return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
 
-        ocr_text = ocr_with_azure_di(file_bytes, file.content_type or "application/octet-stream")
+        ocr_text = ocr_with_azure_di(file_bytes)
 
         if not ocr_text:
             return {
@@ -182,8 +175,7 @@ async def extract(file: UploadFile = File(...)):
                 "warnings": ["No OCR text found"],
             }
 
-        parsed = call_openai_to_json(ocr_text)
-        return parsed
+        return call_openai_to_json(ocr_text)
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})

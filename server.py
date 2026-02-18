@@ -39,9 +39,10 @@ def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
         credential=AzureKeyCredential(key),
     )
 
+    # FIX: older SDK expects analyze_request=... (not body=...)
     poller = client.begin_analyze_document(
         "prebuilt-read",
-        body=file_bytes,
+        analyze_request=file_bytes,
         content_type=content_type or "application/octet-stream",
     )
     result = poller.result()
@@ -58,20 +59,15 @@ def ocr_with_azure_di(file_bytes: bytes, content_type: str) -> str:
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Try to parse JSON. If the model returns extra text, extract the first {...} block.
-    """
     text = (text or "").strip()
     if not text:
         raise ValueError("Empty OpenAI response")
 
-    # First try direct JSON
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # Fallback: find first '{' and last '}' and parse that slice
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -160,7 +156,6 @@ OCR TEXT:
 \"\"\"
 """.strip()
 
-    # IMPORTANT: do NOT pass response_format here (your installed OpenAI lib rejected it)
     resp = client.responses.create(
         model=model,
         input=prompt,
@@ -168,7 +163,6 @@ OCR TEXT:
 
     out_text = getattr(resp, "output_text", None)
     if not out_text:
-        # Extra safety fallback
         out_text = str(resp)
 
     return _extract_json_object(out_text)

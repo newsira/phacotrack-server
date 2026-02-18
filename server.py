@@ -38,10 +38,6 @@ def normalize_endpoint(raw: str) -> str:
 
 
 def normalize_key(raw: str) -> str:
-    """
-    Remove ALL whitespace (including unicode separators/newlines) from secrets.
-    This prevents weird header encoding issues.
-    """
     if not raw:
         return ""
     raw = unicodedata.normalize("NFC", raw)
@@ -70,7 +66,6 @@ def to_float(v: Any) -> Optional[float]:
         if not s:
             return None
         s = s.replace(",", "")
-        # extract first number like -12.34
         m = re.search(r"[-+]?\d+(\.\d+)?", s)
         if not m:
             return None
@@ -87,7 +82,6 @@ def clean_str(v: Any) -> Optional[str]:
     if isinstance(v, str):
         s = sanitize_text(v)
         return s if s else None
-    # don't coerce non-strings into strings for clinical fields
     return None
 
 
@@ -128,11 +122,6 @@ def coerce_global(g: Any) -> Dict[str, Any]:
 
 
 def normalize_rows(rows_any: Any) -> List[Dict[str, Any]]:
-    """
-    Convert any row format into:
-      { "iolPower": number|null, "targetRefraction": number|null }
-    Dedup + sort by iolPower desc (common in IOL tables).
-    """
     rows: List[Dict[str, Any]] = []
     if not isinstance(rows_any, list):
         return rows
@@ -141,7 +130,6 @@ def normalize_rows(rows_any: Any) -> List[Dict[str, Any]]:
         if not isinstance(r, dict):
             continue
 
-        # Accept multiple key variants
         iol_candidates = [
             r.get("iolPower"), r.get("IOL"), r.get("IOLPower"), r.get("IOL(D)"),
             r.get("IOL_D"), r.get("IOLd"), r.get("IOLpower")
@@ -168,7 +156,6 @@ def normalize_rows(rows_any: Any) -> List[Dict[str, Any]]:
 
         rows.append({"iolPower": iol, "targetRefraction": ref})
 
-    # Deduplicate by rounded (iolPower, targetRefraction)
     seen: set[Tuple[Optional[float], Optional[float]]] = set()
     deduped: List[Dict[str, Any]] = []
     for r in rows:
@@ -181,7 +168,6 @@ def normalize_rows(rows_any: Any) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped.append(r)
 
-    # Sort: iolPower descending, None last
     def sort_key(x: Dict[str, Any]) -> Tuple[int, float]:
         if x["iolPower"] is None:
             return (1, 0.0)
@@ -192,14 +178,6 @@ def normalize_rows(rows_any: Any) -> List[Dict[str, Any]]:
 
 
 def normalize_blocks(blocks_any: Any) -> List[Dict[str, Any]]:
-    """
-    Force blocks into canonical format:
-      { "blockIndex": str|null, "AConstant": str|null, "Formula": str|null, "rows": [ ... ] }
-    Also maps common freestyle keys:
-      IOLModel -> blockIndex
-      Aconst/AConstant -> AConstant
-      IOLrefs -> rows (and rows keys like IOL(D)/REF(D))
-    """
     blocks: List[Dict[str, Any]] = []
     if not isinstance(blocks_any, list):
         return blocks
@@ -208,48 +186,23 @@ def normalize_blocks(blocks_any: Any) -> List[Dict[str, Any]]:
         if not isinstance(b, dict):
             continue
 
-        # canonical / aliases
-        block_index = clean_str(b.get("blockIndex"))
-        if block_index is None:
-            block_index = clean_str(b.get("IOLModel"))
-        if block_index is None:
-            block_index = clean_str(b.get("lensModel"))
-        if block_index is None:
-            # allow numeric blockIndex like "1"
-            bi = b.get("blockIndex")
-            if isinstance(bi, (int, float)):
-                block_index = str(int(bi))
+        block_index = clean_str(b.get("blockIndex")) or clean_str(b.get("IOLModel")) or clean_str(b.get("lensModel"))
 
         aconst = b.get("AConstant")
         if aconst is None:
-            aconst = b.get("Aconst")
-        if aconst is None:
-            aconst = b.get("aconst")
+            aconst = b.get("Aconst") or b.get("aconst")
         aconst_str = None
         if aconst is not None:
-            # keep as string to match your earlier working JSON ("119.00", "118.300")
             fv = to_float(aconst)
             if fv is not None:
-                # preserve 3 decimals if present in input string, else keep clean minimal
-                if isinstance(aconst, str) and re.search(r"\.\d{3,}", aconst):
-                    aconst_str = f"{fv:.3f}"
-                elif isinstance(aconst, str) and re.search(r"\.\d{2}", aconst):
-                    aconst_str = f"{fv:.2f}"
-                else:
-                    # no forced formatting
-                    aconst_str = str(fv).rstrip("0").rstrip(".") if "." in str(fv) else str(fv)
+                # keep 2 decimals if it looks like A-const from IOLMaster
+                aconst_str = f"{fv:.2f}"
             else:
                 aconst_str = clean_str(aconst)
 
-        formula = clean_str(b.get("Formula"))
-        if formula is None:
-            formula = clean_str(b.get("formula"))
+        formula = clean_str(b.get("Formula")) or clean_str(b.get("formula"))
 
-        rows_any = b.get("rows")
-        if rows_any is None:
-            rows_any = b.get("IOLrefs")
-        if rows_any is None:
-            rows_any = b.get("table")
+        rows_any = b.get("rows") or b.get("IOLrefs") or b.get("table")
         rows = normalize_rows(rows_any)
 
         blocks.append({
@@ -272,8 +225,6 @@ def coerce_eye(e: Any) -> Dict[str, Any]:
         else:
             out[k] = to_float(e.get(k))
 
-    # If the model returned some non-canonical block structure (e.g. IOLModel),
-    # try to salvage it by checking other possible keys
     if not out["blocks"]:
         out["blocks"] = normalize_blocks(e.get("Blocks") or e.get("iolBlocks") or e.get("IOLBlocks"))
 
@@ -281,9 +232,6 @@ def coerce_eye(e: Any) -> Dict[str, Any]:
 
 
 def enforce_schema(parsed: Any) -> Dict[str, Any]:
-    """
-    Final gatekeeper: output only the allowed schema, no extra keys.
-    """
     if not isinstance(parsed, dict):
         parsed = {}
 
@@ -323,29 +271,57 @@ def enforce_schema(parsed: Any) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Routes
+# OCR with TABLES (critical fix)
 # ----------------------------
 
-@app.get("/")
-def root():
-    return {"status": "server running"}
+def extract_tables_text(result: Any) -> str:
+    """
+    Turn DI tables into a readable grid string so the LLM can separate the 2x2 blocks.
+    """
+    tables = getattr(result, "tables", None)
+    if not tables:
+        return ""
+
+    out_lines: List[str] = []
+    for ti, t in enumerate(tables, start=1):
+        row_count = getattr(t, "row_count", 0) or 0
+        col_count = getattr(t, "column_count", 0) or 0
+        cells = getattr(t, "cells", None) or []
+
+        # Build empty grid
+        grid: List[List[str]] = [["" for _ in range(col_count)] for _ in range(row_count)]
+
+        for c in cells:
+            r = getattr(c, "row_index", None)
+            cc = getattr(c, "column_index", None)
+            txt = getattr(c, "content", "") or ""
+            if r is None or cc is None:
+                continue
+            if 0 <= r < row_count and 0 <= cc < col_count:
+                grid[r][cc] = sanitize_text(txt)
+
+        out_lines.append(f"[TABLE {ti}] rows={row_count} cols={col_count}")
+        for r in range(row_count):
+            # join with a strong delimiter so the model “sees” columns
+            row_txt = " | ".join((grid[r][c] or "").strip() for c in range(col_count))
+            out_lines.append(row_txt)
+
+        out_lines.append("")  # spacer
+
+    return sanitize_text("\n".join(out_lines))
 
 
-def ocr_with_azure_di(file_bytes: bytes) -> str:
+def ocr_with_azure_di_layout(file_bytes: bytes) -> Dict[str, str]:
     endpoint = normalize_endpoint(must_env("AZURE_DI_ENDPOINT"))
     key = normalize_key(must_env("AZURE_DI_KEY"))
 
-    client = DocumentAnalysisClient(
-        endpoint=endpoint,
-        credential=AzureKeyCredential(key),
-    )
+    client = DocumentAnalysisClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
-    poller = client.begin_analyze_document(
-        model_id="prebuilt-read",
-        document=file_bytes,
-    )
+    # KEY CHANGE: prebuilt-layout gives tables
+    poller = client.begin_analyze_document(model_id="prebuilt-layout", document=file_bytes)
     result = poller.result()
 
+    # Plain text lines
     lines: List[str] = []
     if getattr(result, "pages", None):
         for page in result.pages:
@@ -354,15 +330,25 @@ def ocr_with_azure_di(file_bytes: bytes) -> str:
                     if getattr(line, "content", None):
                         lines.append(line.content)
 
-    return sanitize_text("\n".join(lines))
+    plain_text = sanitize_text("\n".join(lines))
+    tables_text = extract_tables_text(result)
+
+    return {"plainText": plain_text, "tablesText": tables_text}
 
 
-def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
-    api_key_raw = os.getenv("OPENAI_API_KEY", "")
-    api_key = normalize_key(api_key_raw)
+# ----------------------------
+# OpenAI parse
+# ----------------------------
+
+@app.get("/")
+def root():
+    return {"status": "server running"}
+
+
+def call_openai_to_json(plain_text: str, tables_text: str) -> Dict[str, Any]:
+    api_key = normalize_key(os.getenv("OPENAI_API_KEY", ""))
 
     if not api_key or OpenAI is None:
-        # Still return canonical schema (app-safe), plus rawText in warnings only.
         return {
             "success": True,
             "documentType": "unknown",
@@ -380,13 +366,11 @@ def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
     model = (os.getenv("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini").strip()
     client = OpenAI(api_key=api_key)
 
-    ocr_text = sanitize_text(ocr_text)
+    plain_text = sanitize_text(plain_text)
+    tables_text = sanitize_text(tables_text)
 
-    # IMPORTANT: strict schema + strict block format
     prompt = f"""
-You are a STRICT JSON generator.
-
-Input is OCR text from ONE ophthalmology-related document image.
+You are a STRICT JSON generator for ophthalmology documents.
 
 You MUST output ONLY a JSON object. No extra text.
 
@@ -399,12 +383,13 @@ Pick documentType EXACTLY as one of:
 - clinicNote
 - unknown
 
-You MUST use this EXACT schema and EXACT key names.
-Do NOT invent new keys.
-Do NOT use parentheses in keys.
-If unsure, use null or empty arrays. Do NOT guess.
+IMPORTANT FOR IOLMASTER SHEETS:
+- There are OFTEN 4 IOL tables for OD and 4 IOL tables for OS (8 total).
+- Each mini-table has an IOL model name + "A const:" + a 2-column table "IOL (D)" and "REF (D)".
+- Use blockIndex = the IOL model name (e.g., "Alcon SA60WF", "ALCON MA60AC", "RX Rohto RE06F", "JOHNSON OPTIBLUE (ZCB00V)").
+- If you can see 4 tables per eye, output 4 blocks per eye. Do NOT merge different IOL models into one block.
 
-Schema:
+Schema (use EXACT keys, do not add new keys):
 
 {{
   "success": true,
@@ -461,20 +446,22 @@ Schema:
 
 Rules:
 - Numbers must be real numbers (no commas).
-- For biometry: fill OD/OS AL/K/ACD etc. Include blocks ONLY if the OCR text clearly contains IOL tables.
-- For ecc: fill ecc/cv/hex/pachy etc.
-- For phacoSummary: fill fields.efx / fields.ust / fields.avg. OD/OS can stay null.
-- Be conservative.
+- If unsure, use null. Do NOT guess.
+- Use TABLES below to separate each IOL model correctly.
 
-OCR TEXT:
+PLAIN OCR TEXT:
 \"\"\"
-{ocr_text}
+{plain_text}
+\"\"\"
+
+TABLES (from Azure layout):
+\"\"\"
+{tables_text}
 \"\"\"
 """.strip()
 
-    parsed_any: Any = None
+    parsed_any: Any
 
-    # Try Responses API first (newer)
     try:
         resp = client.responses.create(
             model=model,
@@ -483,7 +470,6 @@ OCR TEXT:
         )
         parsed_any = json.loads(resp.output_text)
     except Exception:
-        # Fallback to Chat Completions
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -491,7 +477,6 @@ OCR TEXT:
         )
         parsed_any = json.loads(resp.choices[0].message.content)
 
-    # Hard schema enforcement (fixes freestyle keys, dedupes rows, strips extras)
     return enforce_schema(parsed_any)
 
 
@@ -502,8 +487,11 @@ async def extract(file: UploadFile = File(...)):
         if not file_bytes:
             return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
 
-        ocr_text = ocr_with_azure_di(file_bytes)
-        if not ocr_text:
+        ocr = ocr_with_azure_di_layout(file_bytes)
+        plain_text = ocr.get("plainText", "")
+        tables_text = ocr.get("tablesText", "")
+
+        if not plain_text and not tables_text:
             return {
                 "success": True,
                 "documentType": "unknown",
@@ -518,7 +506,7 @@ async def extract(file: UploadFile = File(...)):
                 "warnings": ["No OCR text found"],
             }
 
-        return call_openai_to_json(ocr_text)
+        return call_openai_to_json(plain_text, tables_text)
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})

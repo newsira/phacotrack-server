@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 python-multipart
-requests
-azure-ai-documentintelligence
-azure-core
+azure-ai-documentintelligence>=1.0.0b1
+openai

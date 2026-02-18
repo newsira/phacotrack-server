@@ -1,5 +1,7 @@
 import os
 import json
+import re
+import unicodedata
 from typing import Dict, Any
 
 from fastapi import FastAPI, UploadFile, File
@@ -37,6 +39,31 @@ def normalize_endpoint(raw: str) -> str:
     return v
 
 
+def sanitize_text(s: str) -> str:
+    """
+    Remove problematic unicode/control characters that can crash some HTTP stacks
+    when they try to encode text as ASCII (e.g. U+2028 / U+2029).
+    """
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFC", s)
+
+    # Replace common “line separator” / “paragraph separator” with normal newline
+    s = s.replace("\u2028", "\n").replace("\u2029", "\n")
+
+    # Remove ASCII control chars + C1 controls
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", s)
+
+    # Remove BOM/zero-width stuff
+    s = s.replace("\ufeff", "").replace("\u200b", "")
+
+    # Collapse weird whitespace
+    s = re.sub(r"[ \t\r\f\v]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    return s.strip()
+
+
 def ocr_with_azure_di(file_bytes: bytes) -> str:
     endpoint = normalize_endpoint(env("AZURE_DI_ENDPOINT"))
     key = env("AZURE_DI_KEY").strip()
@@ -48,7 +75,7 @@ def ocr_with_azure_di(file_bytes: bytes) -> str:
 
     poller = client.begin_analyze_document(
         model_id="prebuilt-read",
-        document=file_bytes,  # ✅ don't pass content_type here (fixes your error)
+        document=file_bytes,
     )
     result = poller.result()
 
@@ -60,7 +87,7 @@ def ocr_with_azure_di(file_bytes: bytes) -> str:
                     if getattr(line, "content", None):
                         lines.append(line.content)
 
-    return "\n".join(lines).strip()
+    return sanitize_text("\n".join(lines))
 
 
 def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
@@ -76,6 +103,9 @@ def call_openai_to_json(ocr_text: str) -> Dict[str, Any]:
 
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     client = OpenAI(api_key=api_key)
+
+    # extra safety: sanitize again before prompting
+    ocr_text = sanitize_text(ocr_text)
 
     prompt = f"""
 You are a medical document parser for ophthalmology clinic documents.

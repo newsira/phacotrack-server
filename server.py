@@ -3,7 +3,7 @@ import os
 import json
 import re
 import unicodedata
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
 
-# OpenAI (only used if OPENAI_API_KEY is set)
 try:
     from openai import OpenAI
 except Exception:
@@ -21,14 +20,11 @@ except Exception:
 app = FastAPI()
 
 
-# -----------------------------
-# Small helpers (safe + simple)
-# -----------------------------
 def must_env(name: str) -> str:
     v = os.getenv(name)
-    if v is None or v.strip() == "":
+    if v is None or v == "":
         raise RuntimeError(f"Missing environment variable: {name}")
-    return v.strip()
+    return v
 
 
 def normalize_endpoint(raw: str) -> str:
@@ -40,8 +36,8 @@ def normalize_endpoint(raw: str) -> str:
 
 def normalize_key(raw: str) -> str:
     """
-    Remove ALL whitespace (including unicode newlines like \u2028) from secrets.
-    Prevents weird header encoding crashes.
+    Remove ALL whitespace (including unicode separators/newlines) from secrets.
+    Prevents weird header / ascii crashes if key got pasted with hidden chars.
     """
     if not raw:
         return ""
@@ -53,157 +49,202 @@ def sanitize_text(s: str) -> str:
     if not s:
         return ""
     s = unicodedata.normalize("NFC", s)
-    # Normalize odd unicode line separators
     s = s.replace("\u2028", "\n").replace("\u2029", "\n")
-    # Remove control chars
     s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", s)
     s = s.replace("\ufeff", "").replace("\u200b", "")
-    # Compact whitespace
     s = re.sub(r"[ \t\r\f\v]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 
-def safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).strip()
-        if s == "":
-            return None
-        s = s.replace(",", "")
-        return float(s)
-    except Exception:
-        return None
-
-
-# -----------------------------
-# Health
-# -----------------------------
 @app.get("/")
 def root():
     return {"status": "server running"}
 
 
-# -----------------------------
-# Azure DI: PREBUILT-LAYOUT
-# Returns: full text + tables/cells
-# -----------------------------
-def layout_with_azure_di(file_bytes: bytes) -> Dict[str, Any]:
+def _polygon_center_x(polygon: List[Dict[str, float]]) -> Optional[float]:
+    """
+    polygon looks like: [{"x":..., "y":...}, ...]
+    Return average x.
+    """
+    if not polygon:
+        return None
+    xs = [p.get("x") for p in polygon if isinstance(p, dict) and p.get("x") is not None]
+    if not xs:
+        return None
+    return sum(xs) / float(len(xs))
+
+
+def _page_width(result, page_number_1based: int) -> Optional[float]:
+    pages = getattr(result, "pages", None) or []
+    for p in pages:
+        if getattr(p, "page_number", None) == page_number_1based:
+            return getattr(p, "width", None)
+    return None
+
+
+def _table_to_matrix(table) -> List[List[str]]:
+    """
+    Convert Azure table cells into a 2D matrix [row][col] of strings.
+    """
+    row_count = int(getattr(table, "row_count", 0) or 0)
+    col_count = int(getattr(table, "column_count", 0) or 0)
+
+    if row_count <= 0 or col_count <= 0:
+        return []
+
+    grid: List[List[str]] = [["" for _ in range(col_count)] for _ in range(row_count)]
+
+    cells = getattr(table, "cells", None) or []
+    for c in cells:
+        r = getattr(c, "row_index", None)
+        k = getattr(c, "column_index", None)
+        txt = getattr(c, "content", None) or ""
+        if r is None or k is None:
+            continue
+        if 0 <= r < row_count and 0 <= k < col_count:
+            # Sometimes same cell appears twice; keep the longer content
+            if len(txt.strip()) > len(grid[r][k].strip()):
+                grid[r][k] = txt.strip()
+
+    # Trim trailing empty columns per row (but keep at least 2 cols if present)
+    out: List[List[str]] = []
+    for row in grid:
+        # remove trailing empty
+        while len(row) > 0 and row[-1].strip() == "":
+            row.pop()
+        out.append(row)
+
+    return out
+
+
+def extract_text_and_tables_by_eye(file_bytes: bytes) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Use Azure DI (prebuilt-layout) to get:
+    - text lines
+    - tables + coordinates
+    Then split tables into OD (left) vs OS (right) using page width midpoint.
+    """
     endpoint = normalize_endpoint(must_env("AZURE_DI_ENDPOINT"))
     key = normalize_key(must_env("AZURE_DI_KEY"))
 
-    client = DocumentAnalysisClient(
-        endpoint=endpoint,
-        credential=AzureKeyCredential(key),
-    )
+    client = DocumentAnalysisClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
-    # IMPORTANT:
-    # - Use model_id="prebuilt-layout"
-    # - Pass document=... (NOT body=...)
-    # - Do NOT pass content_type here (avoids "multiple values for content_type")
     poller = client.begin_analyze_document(
         model_id="prebuilt-layout",
         document=file_bytes,
     )
     result = poller.result()
 
-    # Collect lines (reading order)
-    lines: List[str] = []
-    if getattr(result, "pages", None):
-        for page in result.pages:
-            if getattr(page, "lines", None):
-                for line in page.lines:
-                    if getattr(line, "content", None):
-                        lines.append(line.content)
+    # ---- Text (for headers like patient name, HN, exam date, etc.)
+    lines_out: List[str] = []
+    pages = getattr(result, "pages", None) or []
+    for page in pages:
+        page_lines = getattr(page, "lines", None) or []
+        for line in page_lines:
+            content = getattr(line, "content", None)
+            if content:
+                lines_out.append(content)
 
-    full_text = sanitize_text("\n".join(lines))
+    full_text = sanitize_text("\n".join(lines_out))
 
-    # Collect tables/cells
-    tables_out: List[Dict[str, Any]] = []
-    if getattr(result, "tables", None):
-        for t_index, table in enumerate(result.tables):
-            t = {
-                "tableIndex": t_index,
-                "rowCount": int(getattr(table, "row_count", 0) or 0),
-                "columnCount": int(getattr(table, "column_count", 0) or 0),
-                "cells": [],
-            }
+    # ---- Tables split by left/right
+    od_tables: List[Dict[str, Any]] = []
+    os_tables: List[Dict[str, Any]] = []
 
-            # Cells have row_index, column_index, content
-            for cell in getattr(table, "cells", []) or []:
-                t["cells"].append(
-                    {
-                        "rowIndex": int(getattr(cell, "row_index", 0) or 0),
-                        "columnIndex": int(getattr(cell, "column_index", 0) or 0),
-                        "content": sanitize_text(getattr(cell, "content", "") or ""),
-                    }
-                )
+    tables = getattr(result, "tables", None) or []
+    for idx, t in enumerate(tables, start=1):
+        # bounding_regions: list of regions, each has page_number + polygon
+        regions = getattr(t, "bounding_regions", None) or []
+        if not regions:
+            continue
 
-            tables_out.append(t)
+        region0 = regions[0]
+        page_num = getattr(region0, "page_number", None)  # 1-based
+        polygon = getattr(region0, "polygon", None) or []
+        center_x = _polygon_center_x(polygon)
 
-    return {
-        "fullText": full_text,
-        "tables": tables_out,
-    }
+        width = _page_width(result, page_num) if page_num else None
+        if width is None or center_x is None:
+            # If no geometry, don't guess: put into "unassigned" bucket by treating as OD for now? better: skip.
+            continue
+
+        side = "left" if center_x < (float(width) / 2.0) else "right"
+        matrix = _table_to_matrix(t)
+
+        table_obj = {
+            "index": idx,
+            "page": page_num,
+            "side": side,
+            "centerX": center_x,
+            "pageWidth": width,
+            "matrix": matrix
+        }
+
+        if side == "left":
+            od_tables.append(table_obj)
+        else:
+            os_tables.append(table_obj)
+
+    return full_text, od_tables, os_tables
 
 
-# -----------------------------
-# OpenAI: use TABLES (not flat OCR)
-# -----------------------------
-def call_openai_to_json(layout_payload: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = normalize_key(os.getenv("OPENAI_API_KEY", ""))
+def call_openai_to_json(ocr_text: str, od_tables: List[Dict[str, Any]], os_tables: List[Dict[str, Any]]) -> Dict[str, Any]:
+    api_key = normalize_key(os.getenv("OPENAI_API_KEY", "") or "")
     if not api_key or OpenAI is None:
-        # No OpenAI available: return what we have (so you can debug tables)
         return {
             "success": True,
             "documentType": "unknown",
             "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None},
-            "warnings": ["OPENAI_API_KEY not set (returning Azure layout payload only)"],
-            "azureLayout": layout_payload,
+            "warnings": ["OPENAI_API_KEY not set (returning OCR only)"],
+            "rawText": ocr_text,
+            "tables": {"OD": od_tables, "OS": os_tables},
         }
 
     model = (os.getenv("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini").strip()
     client = OpenAI(api_key=api_key)
 
-    # Keep payload small but structured
-    payload_for_ai = {
-        "fullText": layout_payload.get("fullText", ""),
-        "tables": layout_payload.get("tables", []),
+    ocr_text = sanitize_text(ocr_text)
+
+    # We feed OpenAI BOTH text + tables, already grouped by eye using Azure coordinates.
+    # Rule: DO NOT move tables between eyes.
+    payload = {
+        "ocrText": ocr_text,
+        "tablesByEye": {
+            "OD": od_tables,
+            "OS": os_tables
+        },
+        "importantRule": "OD tables come from LEFT side of page, OS tables come from RIGHT side of page. Do NOT swap them."
     }
 
-    # Clear, strict rules: OpenAI should NOT guess.
-    # It must only use evidence from tables/text.
     prompt = f"""
-You convert ophthalmology document content into STRICT JSON for an app.
+You are a careful ophthalmology document parser.
 
-Input contains:
-1) fullText (all text lines)
-2) tables: array of tables, each with rowCount/columnCount and cells (rowIndex, columnIndex, content)
+You will receive:
+1) OCR text (headers + general text)
+2) Tables already grouped by eye using Azure table coordinates:
+   - tablesByEye.OD = LEFT side of page (OD)
+   - tablesByEye.OS = RIGHT side of page (OS)
 
-IMPORTANT:
-- DO NOT guess.
-- If a value is not clearly present, set it to null.
-- For biometry sheets, you MUST extract ALL IOL tables you can see.
-- For ZEISS/IOLMaster Advanced sheets: there are usually 4 tables per eye (8 total). Do not stop early if more tables exist.
-- Only place an IOL table into OD or OS when it is clearly labeled or grouped near that eye in the content. If you cannot be sure, put a warning and still include the table under a special group "unassignedBlocks" (see schema below).
+CRITICAL RULE:
+- DO NOT move any table from OD to OS or OS to OD.
+- If a table cannot be interpreted, leave it out (do not guess).
 
-Allowed documentType (choose ONE):
-- opticalBiometry
-- immersionBiometry
-- ecc
-- autokeratometry
-- phacoSummary
-- clinicNote
-- unknown
+Your job:
+A) Choose documentType as ONE of:
+   - opticalBiometry
+   - immersionBiometry
+   - ecc
+   - autokeratometry
+   - phacoSummary
+   - clinicNote
+   - unknown
 
-OUTPUT: return ONLY JSON with this exact shape:
+B) Output STRICT JSON only (no extra text) in this exact shape:
 
 {{
   "success": true,
-  "documentType": "opticalBiometry|immersionBiometry|ecc|autokeratometry|phacoSummary|clinicNote|unknown",
+  "documentType": "...",
   "fields": {{
     "global": {{
       "patientName": null|string,
@@ -221,97 +262,56 @@ OUTPUT: return ONLY JSON with this exact shape:
       "sd": null|number, "numCells": null|number, "pachy": null|number,
       "blocks": [
         {{
-          "blockIndex": string,              // lens model name OR "1"/"2"/"3"/"4"
-          "AConstant": string|null,
-          "Formula": string|null,
+          "blockIndex": "string",          // e.g. lens name or '1','2','3','4'
+          "AConstant": "string|null",
+          "Formula": "string|null",
           "rows": [{{"iolPower": number, "targetRefraction": number}}]
         }}
       ]
     }},
-    "OS": {{
-      "AL": null|number, "K1": null|number, "K2": null|number, "ACD": null|number,
-      "LT": null|number, "WTW": null|number, "CCT": null|number,
-      "ecc": null|number, "cv": null|number, "hex": null|number,
-      "avgCellSize": null|number, "maxCellSize": null|number, "minCellSize": null|number,
-      "sd": null|number, "numCells": null|number, "pachy": null|number,
-      "blocks": [
-        {{
-          "blockIndex": string,
-          "AConstant": string|null,
-          "Formula": string|null,
-          "rows": [{{"iolPower": number, "targetRefraction": number}}]
-        }}
-      ]
-    }},
+    "OS": {{ same keys as OD }},
     "efx": null|string,
     "ust": null|string,
-    "avg": null|string,
-    "unassignedBlocks": [
-      {{
-        "blockIndex": string,
-        "AConstant": string|null,
-        "Formula": string|null,
-        "rows": [{{"iolPower": number, "targetRefraction": number}}],
-        "reason": string
-      }}
-    ]
+    "avg": null|string
   }},
   "warnings": []
 }}
 
-Parsing rules for TABLES:
-- A table row is valid only if it contains BOTH an IOL power and a target refraction number.
-- Ignore headers.
-- Convert numbers correctly (e.g., "19.5" -> 19.5).
-- If a table contains duplicated rows, keep them only once.
-- If you see labels like lens model (e.g. "Alcon SA60WF") or A-constant near the table, attach them to that block.
-- If you cannot confidently assign to OD or OS, put it in unassignedBlocks with a short reason.
+Rules:
+- Use null when unknown.
+- Numbers must be numbers (not strings).
+- For optical/immersion biometry:
+  - Extract AL, K1, K2, ACD (and others if present) for OD and OS.
+  - Extract ALL IOL target tables you can find from the provided tablesByEye matrices.
+  - Each eye may have multiple blocks.
+- For ECC:
+  - Put ECC values into OD/OS ecc/cv/hex etc.
+- For phacoSummary:
+  - Fill efx/ust/avg only; keep OD/OS mostly null.
+- Be conservative. No guessing.
 
-INPUT:
-{json.dumps(payload_for_ai, ensure_ascii=False)}
+INPUT (JSON):
+{json.dumps(payload, ensure_ascii=False)}
 """.strip()
 
+    # Prefer Responses API with json_object formatting
     try:
         resp = client.responses.create(
             model=model,
             input=prompt,
             response_format={"type": "json_object"},
         )
-        out = json.loads(resp.output_text)
+        return json.loads(resp.output_text)
     except Exception:
-        # Fallback to chat.completions if needed
+        # fallback
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
-        out = json.loads(resp.choices[0].message.content)
-
-    # Minimal safety normalization (keep app stable)
-    if not isinstance(out, dict):
-        return {"success": False, "error": "OpenAI returned non-object JSON"}
-
-    if out.get("success") is not True:
-        out["success"] = True  # keep shape consistent; warnings will explain
-        out.setdefault("warnings", []).append("OpenAI did not set success=true; forced by server")
-
-    out.setdefault("documentType", "unknown")
-    out.setdefault("fields", {})
-    out["fields"].setdefault("global", {})
-    out["fields"].setdefault("OD", {})
-    out["fields"].setdefault("OS", {})
-    out["fields"].setdefault("efx", None)
-    out["fields"].setdefault("ust", None)
-    out["fields"].setdefault("avg", None)
-    out["fields"].setdefault("unassignedBlocks", [])
-    out.setdefault("warnings", [])
-
-    return out
+        return json.loads(resp.choices[0].message.content)
 
 
-# -----------------------------
-# Main endpoint
-# -----------------------------
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     try:
@@ -319,20 +319,18 @@ async def extract(file: UploadFile = File(...)):
         if not file_bytes:
             return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
 
-        layout = layout_with_azure_di(file_bytes)
+        ocr_text, od_tables, os_tables = extract_text_and_tables_by_eye(file_bytes)
 
-        # If Azure returned no text and no tables, stop early
-        has_text = bool((layout.get("fullText") or "").strip())
-        has_tables = bool(layout.get("tables") or [])
-        if not has_text and not has_tables:
+        # If absolutely no text and no tables, return unknown
+        if not ocr_text and not od_tables and not os_tables:
             return {
                 "success": True,
                 "documentType": "unknown",
-                "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None, "unassignedBlocks": []},
-                "warnings": ["Azure returned no text and no tables"],
+                "fields": {"global": {}, "OD": {}, "OS": {}, "efx": None, "ust": None, "avg": None},
+                "warnings": ["No OCR text or tables found"],
             }
 
-        return call_openai_to_json(layout)
+        return call_openai_to_json(ocr_text, od_tables, os_tables)
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
